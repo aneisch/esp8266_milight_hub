@@ -1,116 +1,147 @@
+#include <functional>
 #include <Arduino.h>
 #include <MiLightRadio.h>
-#include <PL1167_nRF24.h>
-#include <RF24.h>
+#include <MiLightRadioFactory.h>
+#include <MiLightRemoteConfig.h>
+#include <Settings.h>
+#include <GroupStateStore.h>
+#include <PacketSender.h>
+#include <TransitionController.h>
+#include <cstring>
+#include <map>
+#include <set>
 
 #ifndef _MILIGHTCLIENT_H
 #define _MILIGHTCLIENT_H
 
-#define MILIGHT_PACKET_LENGTH 7
+//#define DEBUG_PRINTF
+//#define DEBUG_CLIENT_COMMANDS     // enable to show each individual change command (like hue, brightness, etc)
 
-enum MiLightDeviceType {
-  WHITE = 0xB0,
-  RGBW = 0xB8
+#define FS(str) (reinterpret_cast<const __FlashStringHelper*>(str))
+
+namespace RequestKeys {
+  static const char TRANSITION[] = "transition";
 };
 
-enum MiLightButton {
-  ALL_ON            = 0x01,
-  ALL_OFF           = 0x02,
-  GROUP_1_ON        = 0x03,
-  GROUP_1_OFF       = 0x04,
-  GROUP_2_ON        = 0x05,
-  GROUP_2_OFF       = 0x06,
-  GROUP_3_ON        = 0x07,
-  GROUP_3_OFF       = 0x08,
-  GROUP_4_ON        = 0x09,
-  GROUP_4_OFF       = 0x0A,
-  SPEED_UP          = 0x0B, 
-  SPEED_DOWN        = 0x0C, 
-  DISCO_MODE        = 0x0D,
-  BRIGHTNESS        = 0x0E,
-  COLOR             = 0x0F,
-  ALL_MAX_LEVEL     = 0x11,
-  ALL_MIN_LEVEL     = 0x12,
-  
-  // These are the only mechanism (that I know of) to disable RGB and set the
-  // color to white.
-  GROUP_1_MAX_LEVEL = 0x13,
-  GROUP_1_MIN_LEVEL = 0x14,
-  GROUP_2_MAX_LEVEL = 0x15,
-  GROUP_2_MIN_LEVEL = 0x16,
-  GROUP_3_MAX_LEVEL = 0x17,
-  GROUP_3_MIN_LEVEL = 0x18,
-  GROUP_4_MAX_LEVEL = 0x19,
-  GROUP_4_MIN_LEVEL = 0x1A,
-};
+namespace TransitionParams {
+  static const char FIELD[] PROGMEM = "field";
+  static const char START_VALUE[] PROGMEM = "start_value";
+  static const char END_VALUE[] PROGMEM = "end_value";
+  static const char DURATION[] PROGMEM = "duration";
+  static const char PERIOD[] PROGMEM = "period";
+}
 
-enum MiLightStatus { ON = 0, OFF = 1 };
-  
-struct MiLightPacket {
-  uint8_t deviceType;
-  uint16_t deviceId;
-  uint8_t color;
-  uint8_t brightness;
-  uint8_t groupId;
-  uint8_t button;
-  uint8_t sequenceNum;
-};
+// Used to determine RGB colros that are approximately white
+#define RGB_WHITE_THRESHOLD 10
 
 class MiLightClient {
-  public:
-    MiLightClient(uint8_t cePin, uint8_t csnPin) :
-      sequenceNum(0) {
-      rf = new RF24(cePin, csnPin);
-      prf = new PL1167_nRF24(*rf);
-      radio = new MiLightRadio(*prf);
+public:
+  // Used to indicate that the start value for a transition should be fetched from current state
+  static const int16_t FETCH_VALUE_FROM_STATE = -1;
+
+  MiLightClient(
+    RadioSwitchboard& radioSwitchboard,
+    PacketSender& packetSender,
+    GroupStateStore* stateStore,
+    Settings& settings,
+    TransitionController& transitions
+  );
+
+  ~MiLightClient() { }
+
+  typedef std::function<void(void)> EventHandler;
+
+  void prepare(const MiLightRemoteConfig* remoteConfig, const uint16_t deviceId = -1, const uint8_t groupId = -1);
+  void prepare(const MiLightRemoteType type, const uint16_t deviceId = -1, const uint8_t groupId = -1);
+
+  void setResendCount(const unsigned int resendCount);
+  bool available();
+  size_t read(uint8_t packet[]);
+  void write(uint8_t packet[]);
+
+  void setHeld(bool held);
+
+  // Common methods
+  void updateStatus(MiLightStatus status);
+  void updateStatus(MiLightStatus status, uint8_t groupId);
+  void pair();
+  void unpair();
+  void command(uint8_t command, uint8_t arg);
+  void updateMode(uint8_t mode);
+  void nextMode();
+  void previousMode();
+  void modeSpeedDown();
+  void modeSpeedUp();
+  void toggleStatus();
+
+  // RGBW methods
+  void updateHue(const uint16_t hue);
+  void updateBrightness(const uint8_t brightness);
+  void updateColorWhite();
+  void updateColorRaw(const uint8_t color);
+  void enableNightMode();
+  void updateColor(JsonVariant json);
+
+  // CCT methods
+  void updateTemperature(const uint8_t colorTemperature);
+  void decreaseTemperature();
+  void increaseTemperature();
+  void increaseBrightness();
+  void decreaseBrightness();
+
+  void updateSaturation(const uint8_t saturation);
+
+  void update(JsonObject object);
+  void handleCommand(JsonVariant command);
+  void handleCommands(JsonArray commands);
+  bool handleTransition(JsonObject args, JsonDocument& responseObj);
+  void handleTransition(GroupStateField field, JsonVariant value, float duration, int16_t startValue = FETCH_VALUE_FROM_STATE);
+  void handleEffect(const String& effect);
+
+  void onUpdateBegin(EventHandler handler);
+  void onUpdateEnd(EventHandler handler);
+
+  size_t getNumRadios() const;
+  std::shared_ptr<MiLightRadio> switchRadio(size_t radioIx);
+  std::shared_ptr<MiLightRadio> switchRadio(const MiLightRemoteConfig* remoteConfig);
+  MiLightRemoteConfig& currentRemoteConfig() const;
+
+  // Call to override the number of packet repeats that are sent.  Clear with clearRepeatsOverride
+  void setRepeatsOverride(size_t repeatsOverride);
+
+  // Clear the repeats override so that the default is used
+  void clearRepeatsOverride();
+
+  uint8_t parseStatus(JsonVariant object);
+  JsonVariant extractStatus(JsonObject object);
+
+protected:
+  struct cmp_str {
+    bool operator()(char const *a, char const *b) const {
+        return std::strcmp(a, b) < 0;
     }
-    
-    ~MiLightClient() {
-      delete rf;
-      delete prf;
-      delete radio;
-    }
-    
-    void begin() {
-      radio->begin();
-    }
-    
-    bool available();
-    void read(MiLightPacket& packet);
-    void write(MiLightPacket& packet, const unsigned int resendCount = 50);
-    
-    void write(
-      const uint16_t deviceId,
-      const uint8_t color,
-      const uint8_t brightness,
-      const uint8_t groupId,
-      const MiLightButton button
-    );
-    
-    void updateColorRaw(const uint16_t deviceId, const uint8_t groupId, const uint16_t color);
-    
-    void updateHue(const uint16_t deviceId, const uint8_t groupId, const uint16_t hue);
-    void updateBrightness(const uint16_t deviceId, const uint8_t groupId, const uint8_t brightness);
-    void updateStatus(const uint16_t deviceId, const uint8_t groupId, MiLightStatus status);
-    void updateColorWhite(const uint16_t deviceId, const uint8_t groupId);
-    void pair(const uint16_t deviceId, const uint8_t groupId);
-    void unpair(const uint16_t deviceId, const uint8_t groupId);
-    
-    void allOn(const uint16_t deviceId);
-    void allOff(const uint16_t deviceId);
-    
-    void pressButton(const uint16_t deviceId, const uint8_t groupId, MiLightButton button);
-    
-    static void deserializePacket(const uint8_t rawPacket[], MiLightPacket& packet);
-    static void serializePacket(uint8_t rawPacket[], const MiLightPacket& packet);
-    
-  private:
-    RF24 *rf;
-    PL1167_nRF24 *prf;
-    MiLightRadio* radio;
-    uint8_t sequenceNum;
-    
-    uint8_t nextSequenceNum();
+  };
+  static const std::map<const char*, std::function<void(MiLightClient*, JsonVariant)>, cmp_str> FIELD_SETTERS;
+  static const char* FIELD_ORDERINGS[];
+
+  RadioSwitchboard& radioSwitchboard;
+  std::vector<std::shared_ptr<MiLightRadio>> radios;
+  std::shared_ptr<MiLightRadio> currentRadio;
+  const MiLightRemoteConfig* currentRemote;
+
+  EventHandler updateBeginHandler;
+  EventHandler updateEndHandler;
+
+  GroupStateStore* stateStore;
+  const GroupState* currentState;
+  Settings& settings;
+  PacketSender& packetSender;
+  TransitionController& transitions;
+
+  // If set, override the number of packet repeats used.
+  size_t repeatsOverride;
+
+  void flushPacket();
 };
 
 #endif
